@@ -1,0 +1,103 @@
+from nltk.corpus import wordnet
+import random
+
+# Ensure the necessary NLTK data is downloaded
+import nltk
+nltk.download('wordnet')
+nltk.download('omw-1.4')
+
+# 2. Function to find synonyms
+def get_synonyms(word):
+    synonyms = set()
+    for syn in wordnet.synsets(word):
+        for lemma in syn.lemmas():
+            synonyms.add(lemma.name())
+    return list(synonyms)
+
+# 3. Data Augmentation for neutral class (replacing words with synonyms)
+def augment_data_with_synonyms(text, neutral_threshold=0.8):
+    words = text.split()
+    augmented_text = words[:]
+    for i, word in enumerate(words):
+        if random.random() < neutral_threshold:  # Only augment neutral class
+            synonyms = get_synonyms(word)
+            if synonyms:
+                new_word = random.choice(synonyms)
+                augmented_text[i] = new_word
+    return " ".join(augmented_text)
+
+# Example of augmentation
+sample_text = "The service was slow and the food was cold."
+augmented_text = augment_data_with_synonyms(sample_text)
+print(f"Original: {sample_text}")
+print(f"Augmented: {augmented_text}")
+
+# 4. Function to balance the dataset by augmenting neutral samples
+def balance_neutral_class(df, neutral_class_label="neutral", augment_percentage=0.5):
+    neutral_df = df[df["sentiment"] == neutral_class_label]
+    augmented_rows = []
+    
+    # Augment the neutral samples by changing words with synonyms
+    for _, row in neutral_df.iterrows():
+        augmented_text = augment_data_with_synonyms(row['review_text'])
+        augmented_row = row.copy()
+        augmented_row['review_text'] = augmented_text
+        augmented_rows.append(augmented_row)
+    
+    augmented_df = pd.DataFrame(augmented_rows)
+    
+    # Append the augmented neutral data back to the dataset
+    df_balanced = pd.concat([df, augmented_df]).reset_index(drop=True)
+    return df_balanced
+
+# Apply the balancing function to your train_df
+train_df = balance_neutral_class(train_df, neutral_class_label="neutral", augment_percentage=0.5)
+
+# 5. Using class weights to handle data imbalance
+from sklearn.utils.class_weight import compute_class_weight
+class_weights = compute_class_weight('balanced', classes=[0, 1, 2], y=train_df["label"])
+class_weights = torch.tensor(class_weights, dtype=torch.float)
+
+# 6. Update the TrainingArguments to include class weights
+from transformers import Trainer, TrainingArguments
+
+def train_with_balanced_data(train_df, model_name="xlm-roberta-base"):
+    # Tokenization and preprocessing for model input
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    def tokenize_batch(batch):
+        return tokenizer(batch["input_text"], truncation=True, max_length=160)
+
+    train_df["input_text"] = train_df["review_text"].apply(lambda x: f"{x} [SEP] {x}")
+    train_ds = Dataset.from_pandas(train_df)
+    train_ds = train_ds.map(tokenize_batch, batched=True)
+    train_ds = train_ds.rename_column("label", "labels")
+
+    # Model and training arguments
+    model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=3, id2label=id2sentiment, label2id=sentiment2id)
+    
+    training_args = TrainingArguments(
+        output_dir="./sentiment_model",
+        num_train_epochs=4,
+        per_device_train_batch_size=8,
+        logging_steps=100,
+        evaluation_strategy="epoch",
+        weight_decay=0.01,
+        save_total_limit=1,
+        class_weight=class_weights  # Use class weights
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_ds,
+        tokenizer=tokenizer,
+        compute_metrics=compute_metrics,
+        class_weights=class_weights
+    )
+
+    trainer.train()
+    return trainer
+
+# Call the function to train the model with balanced data
+trainer = train_with_balanced_data(train_df)
